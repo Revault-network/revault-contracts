@@ -1,2 +1,3 @@
-# contracts
-revault.network smart cointracts
+# revault-contract
+
+revault.network smart contracts
