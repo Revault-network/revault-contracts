@@ -4,7 +4,7 @@ pragma solidity ^0.6.12;
 // vault that controls a single token
 interface IBunnyVault {
 
-    function balanceOf(address account) external view returns (uint256);
+    function balanceOf(address _account) external view returns (uint256);
 
     function withdrawAll() external;
 
@@ -19,4 +19,8 @@ interface IBunnyVault {
     function depositBNB() external payable;
 
     function getReward() external;
+
+    function depositedAt(address _account) external view returns (uint256);
+
+    function minter() external view returns (address);
 }

@@ -8,7 +8,7 @@ contract vRevaToken is BEP20('reva voting token', 'VREVA') {
 
     //@dev See {BEP20-transfer}.
     function transfer(address recipient, uint256 amount) public override returns (bool) {
-        require(false, "Can't transfer VREVA");
+        revert("Can't transfer VREVA");
     }
 
     function transferFrom(
@@ -16,7 +16,7 @@ contract vRevaToken is BEP20('reva voting token', 'VREVA') {
         address recipient,
         uint256 amount
     ) public override returns (bool) {
-        require(false, "Can't transfer VREVA");
+        revert("Can't transfer VREVA");
     }
 
     /// @notice Creates `_amount` token to `_to`. Must only be called by the owner (MasterChef).

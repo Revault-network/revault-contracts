@@ -11,7 +11,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     using SafeMath for uint256;
 
     struct RevaultUserInfo {
-        uint256 balance; // in reVault token
+        uint256 balance;
         uint256 pending;
         uint256 rewardPaid;
     }
@@ -20,14 +20,14 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         uint256 totalPrincipal;
         uint256 tvlBusd;
         uint256 lastRewardBlock;  // Last block number that REVAs distribution occurs.
-        uint256 accRevaPerToken; // Accumulated REVAs per share, times 1e12. See below.
+        uint256 accRevaPerToken; // Accumulated REVAs per token deposited, times 1e12. See below.
     }
 
     // The REVA TOKEN!
     RevaToken public reva;
     // zap
     IZap public zap;
-    //
+    // revault address
     address public revaultAddress;
     // REVA tokens created per block.
     uint256 public revaPerBlock; 
@@ -37,25 +37,24 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     uint256 public revaTreasuryPerBlock; 
     // checkpoint
     uint256 public lastTreasuryRewardBlock;
+    // The TVL of tokens combined
+    uint256 public totalRevaultTvlBusd;
+    // array of tokens deposited
+    address[] public supportedTokens;
 
-    // Info of each user that deposits to a ReVault
+    // Info of each user that deposits through Revault
     mapping (address => mapping (address => RevaultUserInfo)) public revaultUsers;
-    // array of revault addresses
-    address[] private _reVaultList;
-    // mapping reVault address => reVault index
+    // mapping token address => token info
     mapping (address => TokenInfo) public tokens;
-    // Total reva allocation points.
-    uint256 public totalRevaAllocPoint = 0;
-    //
-    uint256 public accReceivedRevaFromFees;
-    //
-    uint256 public accWithdrawnRevaFromfees;
-    // The TVL of all ReVaults combined
-    uint256 public totalRevaultTvlBusd = 0;
 
     event NotifyDeposited(address indexed user, address indexed token, uint amount);
     event NotifyWithdrawn(address indexed user, address indexed token, uint amount);
     event RevaRewardPaid(address indexed user, address indexed token, uint amount);
+    event TreasuryRewardClaimed(uint amount);
+    event SetRevaPerBlock(uint revaPerBlock);
+    event SetRevault(address revaultAddress);
+    event SetTreasury(address treasury);
+    event TokenAdded(address token);
 
     function initialize(
         address _reva,
@@ -66,6 +65,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         uint256 _startBlock
     ) external initializer {
         __Ownable_init();
+        require(_startBlock >= block.number, "Start block must be in future");
         reva = RevaToken(_reva);
         zap = IZap(_zap);
         revaPerBlock = _revaPerBlock;
@@ -91,49 +91,75 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
 
     // View function to see pending REVAs from Revaults on frontend.
     function pendingReva(address _tokenAddress, address _user) external view returns (uint256) {
-        TokenInfo storage tokenInfo = tokens[_tokenAddress];
+        TokenInfo memory tokenInfo = tokens[_tokenAddress];
 
         uint256 accRevaPerToken = tokenInfo.accRevaPerToken;
         if (block.number > tokenInfo.lastRewardBlock && tokenInfo.totalPrincipal != 0) {
             uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
-            uint256 prevTokenTvlBusd = tokenInfo.tvlBusd;
-            uint256 currTokenTvlBusd = zap.getBUSDValue(_tokenAddress, tokenInfo.totalPrincipal);
-            uint256 revaReward;
-            if (prevTokenTvlBusd > currTokenTvlBusd) {
-                uint256 tvlDiff = prevTokenTvlBusd.sub(currTokenTvlBusd);
-                revaReward = multiplier.mul(revaPerBlock).mul(currTokenTvlBusd).div(totalRevaultTvlBusd.sub(tvlDiff));
-            } else if (prevTokenTvlBusd < currTokenTvlBusd) {
-                uint256 tvlDiff = currTokenTvlBusd.sub(prevTokenTvlBusd);
-                revaReward = multiplier.mul(revaPerBlock).mul(currTokenTvlBusd).div(totalRevaultTvlBusd.add(tvlDiff));
-            }
+            uint256 revaReward = multiplier.mul(revaPerBlock).mul(tokenInfo.tvlBusd).div(totalRevaultTvlBusd);
             accRevaPerToken = accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
-
         }
 
         return _calcPending(accRevaPerToken, _tokenAddress, _user);
     }
 
-    function updateRevaultRewards(address _tokenAddress, uint256 _amount, bool _isDeposit) internal {
+    function claim(address token) external override {
+        claimFor(token, msg.sender);
+    }
+
+    function claimFor(address token, address to) public override {
+        _updateRevaultRewards(token, 0, false);
+        RevaultUserInfo storage revaultUserInfo = revaultUsers[token][to];
+        TokenInfo memory tokenInfo = tokens[token];
+
+        uint pending = _calcPending(tokenInfo.accRevaPerToken, token, to);
+        revaultUserInfo.pending = 0;
+        revaultUserInfo.rewardPaid = revaultUserInfo.balance.mul(tokenInfo.accRevaPerToken).div(1e12);
+        reva.mint(to, pending);
+        emit RevaRewardPaid(to, token, pending);
+    }
+
+    function updateAllTvls() external {
+        require(msg.sender == tx.origin, "No flashloans");
+        updateAllRevaultRewards();
+        uint totalTvlBusd = 0;
+        for (uint i = 0; i < supportedTokens.length; i++) {
+            address tokenAddress = supportedTokens[i];
+            TokenInfo storage tokenInfo = tokens[tokenAddress];
+            uint256 tokenTvlBusd = zap.getBUSDValue(tokenAddress, tokenInfo.totalPrincipal);
+            tokenInfo.tvlBusd = tokenTvlBusd;
+            totalTvlBusd = totalTvlBusd.add(tokenTvlBusd);
+        }
+        totalRevaultTvlBusd = totalTvlBusd;
+    }
+
+    function updateRevaultRewards(uint tokenIdx) external {
+        address tokenAddress = supportedTokens[tokenIdx];
+        _updateRevaultRewards(tokenAddress, 0, false);
+    }
+
+    function updateAllRevaultRewards() public {
+        for (uint i = 0; i < supportedTokens.length; i++) {
+            _updateRevaultRewards(supportedTokens[i], 0, false);
+        }
+    }
+
+    /* ========== Private Functions ========== */
+
+    function _updateRevaultRewards(address _tokenAddress, uint256 _amount, bool _isDeposit) internal {
         TokenInfo storage tokenInfo = tokens[_tokenAddress];
         if (block.number <= tokenInfo.lastRewardBlock) {
+            if (_isDeposit) tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.add(_amount);
+            else tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.sub(_amount);
             return;
         }
+
         // NOTE: this is done so that a new token won't get too many rewards
         if (tokenInfo.lastRewardBlock == 0) {
             tokenInfo.lastRewardBlock = block.number;
+            supportedTokens.push(_tokenAddress);
+            emit TokenAdded(_tokenAddress);
         }
-
-        uint256 prevTokenTvlBusd = tokenInfo.tvlBusd;
-        uint256 currTokenTvlBusd = zap.getBUSDValue(_tokenAddress, tokenInfo.totalPrincipal);
-        if (prevTokenTvlBusd > currTokenTvlBusd) {
-            uint256 tvlDiff = prevTokenTvlBusd.sub(currTokenTvlBusd);
-            totalRevaultTvlBusd = totalRevaultTvlBusd.sub(tvlDiff);
-        } else if (prevTokenTvlBusd < currTokenTvlBusd) {
-            uint256 tvlDiff = currTokenTvlBusd.sub(prevTokenTvlBusd);
-            totalRevaultTvlBusd = totalRevaultTvlBusd.add(tvlDiff);
-        }
-
-        tokenInfo.tvlBusd = currTokenTvlBusd;
 
         if (tokenInfo.totalPrincipal > 0 && tokenInfo.tvlBusd > 0) {
             uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
@@ -147,26 +173,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         else tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.sub(_amount);
     }
 
-    function claim(address token) external override {
-        claimFor(token, msg.sender);
-    }
-
-    function claimFor(address token, address to) public override {
-        updateRevaultRewards(token, 0, false);
-        RevaultUserInfo storage revaultUserInfo = revaultUsers[token][to];
-        TokenInfo storage tokenInfo = tokens[token];
-
-        uint pending = _calcPending(tokenInfo.accRevaPerToken, token, to);
-        revaultUserInfo.pending = 0;
-        revaultUserInfo.rewardPaid = revaultUserInfo.balance.mul(tokenInfo.accRevaPerToken).div(1e12);
-        reva.mint(to, pending);
-        emit RevaRewardPaid(to, token, pending);
-    }
-
-    /* ========== Private Functions ========== */
-
     function _calcPending(uint256 accRevaPerToken, address _tokenAddress, address _user) private view returns (uint256) {
-        RevaultUserInfo storage revaultUserInfo = revaultUsers[_tokenAddress][_user];
+        RevaultUserInfo memory revaultUserInfo = revaultUsers[_tokenAddress][_user];
         return revaultUserInfo.balance.mul(accRevaPerToken).div(1e12).sub(revaultUserInfo.rewardPaid).add(revaultUserInfo.pending);
     }
 
@@ -175,24 +183,29 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     function claimTreasuryReward() external onlyTreasury {
         uint256 pendingRewards = block.number.sub(lastTreasuryRewardBlock).mul(revaTreasuryPerBlock);
         reva.mint(msg.sender, pendingRewards);
+        lastTreasuryRewardBlock = block.number;
+        emit TreasuryRewardClaimed(pendingRewards);
     }
 
     function setRevaPerBlock(uint256 _revaPerBlock) external onlyOwner {
         revaPerBlock = _revaPerBlock;
+        emit SetRevaPerBlock(_revaPerBlock);
     }
 
     function setRevault(address _revaultAddress) external onlyOwner {
         revaultAddress = _revaultAddress;
+        emit SetRevault(_revaultAddress);
     }
 
     function setTreasury(address _treasury) external onlyOwner {
         treasury = _treasury;
+        emit SetTreasury(_treasury);
     }
 
     function notifyDeposited(address user, address token, uint amount) external override onlyRevault  {
-        updateRevaultRewards(token, amount, true);
+        _updateRevaultRewards(token, amount, true);
         RevaultUserInfo storage revaultUserInfo = revaultUsers[token][user];
-        TokenInfo storage tokenInfo = tokens[token];
+        TokenInfo memory tokenInfo = tokens[token];
 
         uint pending = _calcPending(tokenInfo.accRevaPerToken, token, user);
         revaultUserInfo.pending = pending;
@@ -202,9 +215,9 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     }
 
     function notifyWithdrawn(address user, address token, uint amount) external override onlyRevault {
-        updateRevaultRewards(token, amount, false);
+        _updateRevaultRewards(token, amount, false);
         RevaultUserInfo storage revaultUserInfo = revaultUsers[token][user];
-        TokenInfo storage tokenInfo = tokens[token];
+        TokenInfo memory tokenInfo = tokens[token];
 
         uint pending = _calcPending(tokenInfo.accRevaPerToken, token, user);
         revaultUserInfo.pending = pending;

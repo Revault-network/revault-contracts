@@ -2,12 +2,14 @@
 pragma solidity ^0.6.12;
 
 import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/IBEP20.sol";
+import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "./interfaces/IZap.sol";
 import "../reva/interfaces/IReVault.sol";
 import "../library/interfaces/IWBNB.sol";
 
 contract ZapAndDeposit is OwnableUpgradeable {
+    using SafeBEP20 for IBEP20;
 
     /* ========== CONSTANT VARIABLES ========== */
 
@@ -31,8 +33,6 @@ contract ZapAndDeposit is OwnableUpgradeable {
 
     receive() external payable {}
 
-    /* ========== View Functions ========== */
-
     /* ========== External Functions ========== */
 
     function zapInTokenAndDeposit(
@@ -43,13 +43,12 @@ contract ZapAndDeposit is OwnableUpgradeable {
         bytes memory _leftCallData,
         bytes memory _rightCallData
     ) public {
-        IBEP20(_from).transferFrom(msg.sender, address(this), amount);
+        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         approveToZap(_from);
         zap.zapInTokenTo(_from, amount, _to, address(this));
         approveToRevault(_to);
         uint balance = IBEP20(_to).balanceOf(address(this));
-        bytes memory newData = abi.encodePacked(balance);
-        bytes memory payload = createAmountPayload(_leftCallData, newData, _rightCallData);
+        bytes memory payload = abi.encodePacked(_leftCallData, balance, _rightCallData);
         revault.depositToVaultFor(balance, _vid, payload, msg.sender);
     }
 
@@ -62,8 +61,7 @@ contract ZapAndDeposit is OwnableUpgradeable {
         zap.zapIn{ value : msg.value }(_to);
         approveToRevault(_to);
         uint balance = IBEP20(_to).balanceOf(address(this));
-        bytes memory newData = abi.encodePacked(balance);
-        bytes memory payload = createAmountPayload(_leftCallData, newData, _rightCallData);
+        bytes memory payload = abi.encodePacked(_leftCallData, balance, _rightCallData);
         revault.depositToVaultFor(balance, _vid, payload, msg.sender);
     }
 
@@ -81,45 +79,37 @@ contract ZapAndDeposit is OwnableUpgradeable {
         uint _vid,
         bytes memory payload
     ) external {
-        IWBNB(WBNB).transferFrom(msg.sender, address(this), amount);
+        IBEP20(WBNB).safeTransferFrom(msg.sender, address(this), amount);
         IWBNB(WBNB).withdraw(amount);
         revault.depositToVaultFor{ value: amount }(amount, _vid, payload, msg.sender);
     }
 
-    /* ========== Private Functions ========== */
-
-    // TODO: assembly optimization
-    function createAmountPayload(bytes memory _leftCallData, bytes memory _newData, bytes memory _rightCallData) private pure returns (bytes memory) {
-        bytes memory payload = new bytes(_leftCallData.length + _rightCallData.length + _newData.length);
-
-        uint k = 0;
-        for (uint i = 0; i < _leftCallData.length; i++) {
-            payload[k] = _leftCallData[i];
-            k++;
-        }
-        for (uint i = 0; i < _newData.length; i++) {
-            payload[k] = _newData[i];
-            k++;
-        }
-        for (uint i = 0; i < _rightCallData.length; i++) {
-            payload[k] = _rightCallData[i];
-            k++;
-        }
-        return payload;
+    function zapTokenToBNBAndDeposit(
+        address _from,
+        uint amount,
+        uint _vid,
+        bytes memory payload
+    ) external {
+        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
+        approveToZap(_from);
+        zap.zapInTokenTo(_from, amount, WBNB, address(this));
+        IWBNB(WBNB).withdraw(IBEP20(WBNB).balanceOf(address(this)));
+        uint bnbAmount = address(this).balance;
+        revault.depositToVaultFor{ value: bnbAmount }(bnbAmount, _vid, payload, msg.sender);
     }
 
     /* ========== RESTRICTED FUNCTIONS ========== */
 
     function approveToZap(address token) private {
         if (!haveApprovedTokenToZap[token]) {
-            IBEP20(token).approve(address(zap), uint(~0));
+            IBEP20(token).safeApprove(address(zap), uint(~0));
             haveApprovedTokenToZap[token] = true;
         }
     }
 
     function approveToRevault(address token) private {
         if (!haveApprovedTokenToRevault[token]) {
-            IBEP20(token).approve(address(revault), uint(~0));
+            IBEP20(token).safeApprove(address(revault), uint(~0));
             haveApprovedTokenToRevault[token] = true;
         }
     }

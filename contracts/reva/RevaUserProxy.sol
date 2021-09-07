@@ -2,11 +2,10 @@
 pragma solidity ^0.6.12;
 
 import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/IBEP20.sol";
+import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
+import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/access/Ownable.sol";
 import "./interfaces/IRevaUserProxy.sol";
-import "../vaults/IBunnyVault.sol";
-import "../vaults/IAutoFarm.sol";
-import "../vaults/IBeefyVault.sol";
 import "../library/interfaces/IWBNB.sol";
 
 // This contract performs withdraws/deposits on behalf
@@ -16,6 +15,8 @@ import "../library/interfaces/IWBNB.sol";
 // the central ReVault contract would deposit into a vault,
 // the 3 days would be reset.
 contract RevaUserProxy is IRevaUserProxy, Ownable {
+    using SafeMath for uint;
+    using SafeBEP20 for IBEP20;
 
     mapping(address => mapping(address => bool)) public haveApprovedTokenToVault;
     address private constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
@@ -35,10 +36,10 @@ contract RevaUserProxy is IRevaUserProxy, Ownable {
         uint depositTokenAmount = IBEP20(_depositTokenAddress).balanceOf(address(this));
         uint vaultTokenAmount = IBEP20(_vaultNativeTokenAddress).balanceOf(address(this));
         if (depositTokenAmount > 0) {
-            IBEP20(_depositTokenAddress).transfer(msg.sender, depositTokenAmount);
+            IBEP20(_depositTokenAddress).safeTransfer(msg.sender, depositTokenAmount);
         }
         if (vaultTokenAmount > 0) {
-            IBEP20(_vaultNativeTokenAddress).transfer(msg.sender, vaultTokenAmount);
+            IBEP20(_vaultNativeTokenAddress).safeTransfer(msg.sender, vaultTokenAmount);
         }
     }
 
@@ -46,6 +47,7 @@ contract RevaUserProxy is IRevaUserProxy, Ownable {
         address _vaultAddress,
         address _depositTokenAddress,
         address _vaultNativeTokenAddress,
+        uint amount,
         bytes calldata _payload
     ) public override payable onlyOwner {
         if (!haveApprovedTokenToVault[_depositTokenAddress][_vaultAddress]) {
@@ -53,14 +55,22 @@ contract RevaUserProxy is IRevaUserProxy, Ownable {
             haveApprovedTokenToVault[_depositTokenAddress][_vaultAddress] = true;
         }
 
+        uint prevBalance;
+        if (msg.value > 0) prevBalance = address(this).balance;
+        else prevBalance = IBEP20(_depositTokenAddress).balanceOf(address(this));
+
         (bool success,) = _vaultAddress.call{value : msg.value}(_payload);
         require(success, "vault call");
 
-        require(IBEP20(_depositTokenAddress).balanceOf(address(this)) == 0, "Proxy didn't deposit all");
+        uint postBalance;
+        if (msg.value > 0) postBalance = address(this).balance;
+        else postBalance = IBEP20(_depositTokenAddress).balanceOf(address(this));
+
+        require(prevBalance.sub(postBalance) == amount, "Proxy didn't deposit exact amount");
 
         uint vaultTokenAmount = IBEP20(_vaultNativeTokenAddress).balanceOf(address(this));
         if (vaultTokenAmount > 0) {
-            IBEP20(_vaultNativeTokenAddress).transfer(msg.sender, vaultTokenAmount);
+            IBEP20(_vaultNativeTokenAddress).safeTransfer(msg.sender, vaultTokenAmount);
         }
     }
 

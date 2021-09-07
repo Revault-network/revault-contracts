@@ -4,12 +4,14 @@ pragma solidity ^0.6.12;
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/IBEP20.sol";
+import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
 import "../library/interfaces/IPancakePair.sol";
 import "../library/interfaces/IPancakeFactory.sol";
 import "../library/interfaces/IPancakeRouter02.sol";
 
 contract Zap is OwnableUpgradeable {
     using SafeMath for uint;
+    using SafeBEP20 for IBEP20;
 
     /* ========== CONSTANT VARIABLES ========== */
 
@@ -32,11 +34,17 @@ contract Zap is OwnableUpgradeable {
     mapping(address => bool) private notFlip;
     mapping(address => bool) private hasApproved;
     mapping(address => address) private routePairAddresses;
-    address[] public tokens;
+
+    address public dustReceiver;
+
+    event SetNotFlip(address token);
+    event SetRoutePairAddress(address asset, address route);
+    event SetDustReceiver(address dustReceiver);
+    event TokenRemoved(uint index);
 
     /* ========== INITIALIZER ========== */
 
-    function initialize() external initializer {
+    function initialize(address _dustReceiver) external initializer {
         __Ownable_init();
         setNotFlip(CAKE);
         setNotFlip(BUNNY);
@@ -48,6 +56,9 @@ contract Zap is OwnableUpgradeable {
         setNotFlip(VAI);
         setNotFlip(BTCB);
         setNotFlip(ETH);
+
+        require(_dustReceiver != address(0), "zero address");
+        dustReceiver = _dustReceiver;
     }
 
     receive() external payable {}
@@ -63,37 +74,35 @@ contract Zap is OwnableUpgradeable {
     }
 
     function getBUSDValue(address _token, uint _amount) external view returns (uint) {
-        // TODO uint decimal = uint(IBEP20(_token).decimals());
-        // for in case token decimals are > 18, math can break here!
         if (isFlip(_token)) {
             IPancakePair pair = IPancakePair(_token);
             address token0 = pair.token0();
             address token1 = pair.token1();
             if (token0 == BUSD || token1 == BUSD) {
-                return IBEP20(BUSD).balanceOf(_token).mul(_amount).div(IBEP20(_token).totalSupply());
+                return IBEP20(BUSD).balanceOf(_token).mul(_amount).mul(2).div(IBEP20(_token).totalSupply());
             } else if (token0 == WBNB || token1 == WBNB) {
                 uint wbnbAmount = IBEP20(WBNB).balanceOf(_token).mul(_amount).div(IBEP20(_token).totalSupply());
-                address busdWbnbPair = FACTORY.getPair(BUSD, WBNB); // TODO: hardcode optimize gas?
-                return IBEP20(BUSD).balanceOf(busdWbnbPair).mul(wbnbAmount).div(IBEP20(WBNB).balanceOf(busdWbnbPair));
+                address busdWbnbPair = FACTORY.getPair(BUSD, WBNB);
+                return IBEP20(BUSD).balanceOf(busdWbnbPair).mul(wbnbAmount).mul(2).div(IBEP20(WBNB).balanceOf(busdWbnbPair));
             } else {
                 require(false, "throw");
-                // TODO (post mvp): support pairs without BUSD/WBNB pair (e.g acsi?)
             }
         } else {
             if (_token == WBNB) {
-                address pair = FACTORY.getPair(BUSD, WBNB); // TODO: hardcode optimize gas?
+                address pair = FACTORY.getPair(BUSD, WBNB);
                 return IBEP20(BUSD).balanceOf(pair).mul(_amount).div(IBEP20(WBNB).balanceOf(pair));
             } else if (routePairAddresses[_token] == address(0)) {
                 address pair = FACTORY.getPair(_token, WBNB);
+                require(pair != address(0), "No pair");
                 uint wbnbAmount = IBEP20(WBNB).balanceOf(pair).mul(_amount).div(IBEP20(_token).balanceOf(pair));
-                address busdBnbPair = FACTORY.getPair(BUSD, WBNB); // TODO: hardcode optimize gas?
+                address busdBnbPair = FACTORY.getPair(BUSD, WBNB);
                 return IBEP20(BUSD).balanceOf(busdBnbPair).mul(wbnbAmount).div(IBEP20(WBNB).balanceOf(busdBnbPair));
             } else if (routePairAddresses[_token] == BUSD) {
                 address pair = FACTORY.getPair(_token, BUSD);
+                require(pair != address(0), "No pair");
                 return IBEP20(BUSD).balanceOf(pair).mul(_amount).div(IBEP20(_token).balanceOf(pair));
             } else {
-                require(false, "throw");
-                // TODO (post mvp): support tokens without BUSD/WBNB pair (e.g acsi?)
+                revert("Unsupported token");
             }
         }
     }
@@ -101,7 +110,7 @@ contract Zap is OwnableUpgradeable {
     /* ========== External Functions ========== */
 
     function zapInTokenTo(address _from, uint amount, address _to, address receiver) public {
-        IBEP20(_from).transferFrom(msg.sender, address(this), amount);
+        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         _approveTokenIfNeeded(_from);
         if (isFlip(_from)) {
             // NOTE: We support every zap except flip <-> flip
@@ -125,7 +134,7 @@ contract Zap is OwnableUpgradeable {
                 address other = _from == token0 ? token1 : token0;
                 uint sellAmount = amount.div(2);
                 uint otherAmount = _swap(_from, sellAmount, other, address(this));
-                _addLiquidity(token0, token1, amount.sub(sellAmount), otherAmount, receiver);
+                _addLiquidity(_from, other, amount.sub(sellAmount), otherAmount, receiver);
             } else {
                 uint bnbAmount = _swapTokenForBNB(_from, amount, address(this));
                 _swapBNBToFlip(_to, bnbAmount, receiver);
@@ -144,7 +153,7 @@ contract Zap is OwnableUpgradeable {
     }
 
     function zapOut(address _from, uint amount) external {
-        IBEP20(_from).transferFrom(msg.sender, address(this), amount);
+        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         _approveTokenIfNeeded(_from);
 
         if (!isFlip(_from)) {
@@ -173,6 +182,16 @@ contract Zap is OwnableUpgradeable {
         _approveTokenIfNeeded(token0);
         _approveTokenIfNeeded(token1);
         ROUTER_V2.addLiquidity(token0, token1, amount0, amount1, 0, 0, receiver, block.timestamp);
+
+		// Dust
+        uint leftoverToken0 = IBEP20(token0).balanceOf(address(this));
+        uint leftoverToken1 = IBEP20(token1).balanceOf(address(this));
+        if (leftoverToken0 > 0) {
+            IBEP20(token0).safeTransfer(dustReceiver, leftoverToken0);
+        }
+        if (leftoverToken1 > 0) {
+            IBEP20(token1).safeTransfer(dustReceiver, leftoverToken1);
+        }
     }
 
     function _addLiquidityBNB(
@@ -183,11 +202,21 @@ contract Zap is OwnableUpgradeable {
     ) private {
         _approveTokenIfNeeded(token);
         ROUTER_V2.addLiquidityETH{value : amountBNB }(token, tokenAmount, 0, 0, receiver, block.timestamp);
+
+		// Dust
+        uint leftoverToken = IBEP20(token).balanceOf(address(this));
+        uint leftoverBNB = address(this).balance;
+        if (leftoverToken > 0) {
+            IBEP20(token).safeTransfer(dustReceiver, leftoverToken);
+        }
+        if (leftoverBNB > 0) {
+            payable(dustReceiver).transfer(leftoverBNB);
+        }
     }
 
     function _approveTokenIfNeeded(address token) private {
         if (!hasApproved[token]) {
-            IBEP20(token).approve(address(ROUTER_V2), uint(~0));
+            IBEP20(token).safeApprove(address(ROUTER_V2), uint(~0));
             hasApproved[token] = true;
         }
     }
@@ -318,40 +347,17 @@ contract Zap is OwnableUpgradeable {
 
     function setRoutePairAddress(address asset, address route) external onlyOwner {
         routePairAddresses[asset] = route;
+        emit SetRoutePairAddress(asset, route);
     }
 
     function setNotFlip(address token) public onlyOwner {
-        bool needPush = notFlip[token] == false;
         notFlip[token] = true;
-        if (needPush) {
-            tokens.push(token);
-        }
+        emit SetNotFlip(token);
     }
 
-    function removeToken(uint i) external onlyOwner {
-        address token = tokens[i];
-        notFlip[token] = false;
-        tokens[i] = tokens[tokens.length - 1];
-        tokens.pop();
-    }
-
-    function sweep() external onlyOwner {
-        for (uint i = 0; i < tokens.length; i++) {
-            address token = tokens[i];
-            if (token == address(0)) continue;
-            uint amount = IBEP20(token).balanceOf(address(this));
-            if (amount > 0) {
-                _swapTokenForBNB(token, amount, owner());
-            }
-        }
-    }
-
-    function withdraw(address token) external onlyOwner {
-        if (token == address(0)) {
-            payable(owner()).transfer(address(this).balance);
-            return;
-        }
-
-        IBEP20(token).transfer(owner(), IBEP20(token).balanceOf(address(this)));
+    function setDustReceiver(address _dustReceiver) external onlyOwner {
+        require(_dustReceiver != address(0), "zero address");
+        dustReceiver = _dustReceiver;
+        emit SetDustReceiver(_dustReceiver);
     }
 }
