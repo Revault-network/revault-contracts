@@ -8,11 +8,17 @@ interface IBeefyVault {
 
     function withdrawAll() external;
 
+    function withdrawAllBNB() external;
+
     function depositAll() external;
 
-    function withdraw(uint256 _amount) external;
+    function withdraw(uint256 _shares) external;
+
+    function withdrawBNB(uint256 _shares) external;
 
     function deposit(uint256 _amount) external;
+
+    function depositBNB() external payable;
 
     function balanceOf(address account) external view returns (uint256);
 

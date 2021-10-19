@@ -74,16 +74,6 @@ contract ZapAndDeposit is OwnableUpgradeable {
         revault.depositToVaultFor(msg.value, _vid, payload, msg.sender);
     }
 
-    function zapWBNBToBNBAndDeposit(
-        uint amount,
-        uint _vid,
-        bytes memory payload
-    ) external {
-        IBEP20(WBNB).safeTransferFrom(msg.sender, address(this), amount);
-        IWBNB(WBNB).withdraw(amount);
-        revault.depositToVaultFor{ value: amount }(amount, _vid, payload, msg.sender);
-    }
-
     function zapTokenToBNBAndDeposit(
         address _from,
         uint amount,
@@ -92,8 +82,7 @@ contract ZapAndDeposit is OwnableUpgradeable {
     ) external {
         IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         approveToZap(_from);
-        zap.zapInTokenTo(_from, amount, WBNB, address(this));
-        IWBNB(WBNB).withdraw(IBEP20(WBNB).balanceOf(address(this)));
+        zap.zapInTokenToBNB(_from, amount);
         uint bnbAmount = address(this).balance;
         revault.depositToVaultFor{ value: bnbAmount }(bnbAmount, _vid, payload, msg.sender);
     }

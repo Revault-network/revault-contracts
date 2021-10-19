@@ -21,6 +21,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         uint256 tvlBusd;
         uint256 lastRewardBlock;  // Last block number that REVAs distribution occurs.
         uint256 accRevaPerToken; // Accumulated REVAs per token deposited, times 1e12. See below.
+        bool rewardsEnabled;
     }
 
     // The REVA TOKEN!
@@ -55,6 +56,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     event SetRevault(address revaultAddress);
     event SetTreasury(address treasury);
     event TokenAdded(address token);
+    event TokenRewardsDisabled(address token);
+    event TokenRewardsEnabled(address token);
 
     function initialize(
         address _reva,
@@ -94,7 +97,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         TokenInfo memory tokenInfo = tokens[_tokenAddress];
 
         uint256 accRevaPerToken = tokenInfo.accRevaPerToken;
-        if (block.number > tokenInfo.lastRewardBlock && tokenInfo.totalPrincipal != 0) {
+        if (block.number > tokenInfo.lastRewardBlock && tokenInfo.totalPrincipal != 0 && totalRevaultTvlBusd > 0 && tokenInfo.rewardsEnabled) {
             uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
             uint256 revaReward = multiplier.mul(revaPerBlock).mul(tokenInfo.tvlBusd).div(totalRevaultTvlBusd);
             accRevaPerToken = accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
@@ -126,9 +129,11 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         for (uint i = 0; i < supportedTokens.length; i++) {
             address tokenAddress = supportedTokens[i];
             TokenInfo storage tokenInfo = tokens[tokenAddress];
-            uint256 tokenTvlBusd = zap.getBUSDValue(tokenAddress, tokenInfo.totalPrincipal);
-            tokenInfo.tvlBusd = tokenTvlBusd;
-            totalTvlBusd = totalTvlBusd.add(tokenTvlBusd);
+            if (tokenInfo.rewardsEnabled) {
+                uint256 tokenTvlBusd = zap.getBUSDValue(tokenAddress, tokenInfo.totalPrincipal);
+                tokenInfo.tvlBusd = tokenTvlBusd;
+                totalTvlBusd = totalTvlBusd.add(tokenTvlBusd);
+            }
         }
         totalRevaultTvlBusd = totalTvlBusd;
     }
@@ -144,6 +149,10 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         }
     }
 
+    function getSupportedTokensCount() external view returns (uint256) {
+      return supportedTokens.length;
+    }
+
     /* ========== Private Functions ========== */
 
     function _updateRevaultRewards(address _tokenAddress, uint256 _amount, bool _isDeposit) internal {
@@ -157,11 +166,12 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         // NOTE: this is done so that a new token won't get too many rewards
         if (tokenInfo.lastRewardBlock == 0) {
             tokenInfo.lastRewardBlock = block.number;
+            tokenInfo.rewardsEnabled = true;
             supportedTokens.push(_tokenAddress);
             emit TokenAdded(_tokenAddress);
         }
 
-        if (tokenInfo.totalPrincipal > 0 && tokenInfo.tvlBusd > 0) {
+        if (tokenInfo.totalPrincipal > 0 && totalRevaultTvlBusd > 0 && tokenInfo.rewardsEnabled) {
             uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
             uint256 revaReward = multiplier.mul(revaPerBlock).mul(tokenInfo.tvlBusd).div(totalRevaultTvlBusd);
             tokenInfo.accRevaPerToken = tokenInfo.accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
@@ -185,6 +195,33 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         reva.mint(msg.sender, pendingRewards);
         lastTreasuryRewardBlock = block.number;
         emit TreasuryRewardClaimed(pendingRewards);
+    }
+
+    function disableTokenRewards(uint tokenIdx) external onlyOwner {
+        address tokenAddress = supportedTokens[tokenIdx];
+        TokenInfo storage tokenInfo = tokens[tokenAddress];
+        require(tokenInfo.rewardsEnabled, "token rewards already disabled");
+
+        updateAllRevaultRewards();
+        totalRevaultTvlBusd = totalRevaultTvlBusd.sub(tokenInfo.tvlBusd);
+        tokenInfo.tvlBusd = 0;
+
+        tokenInfo.rewardsEnabled = false;
+        emit TokenRewardsDisabled(tokenAddress);
+    }
+
+    function enableTokenRewards(uint tokenIdx) external onlyOwner {
+        address tokenAddress = supportedTokens[tokenIdx];
+        TokenInfo storage tokenInfo = tokens[tokenAddress];
+        require(!tokenInfo.rewardsEnabled, "token rewards already enabled");
+
+        updateAllRevaultRewards();
+        uint256 tokenTvlBusd = zap.getBUSDValue(tokenAddress, tokenInfo.totalPrincipal);
+        tokenInfo.tvlBusd = tokenTvlBusd;
+        totalRevaultTvlBusd = totalRevaultTvlBusd.add(tokenTvlBusd);
+
+        tokenInfo.rewardsEnabled = true;
+        emit TokenRewardsEnabled(tokenAddress);
     }
 
     function setRevaPerBlock(uint256 _revaPerBlock) external onlyOwner {

@@ -5,11 +5,12 @@ import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/IBEP20.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
+import "../library/TransferHelper.sol";
 import "../library/interfaces/IPancakePair.sol";
 import "../library/interfaces/IPancakeFactory.sol";
 import "../library/interfaces/IPancakeRouter02.sol";
 
-contract Zap is OwnableUpgradeable {
+contract Zap is OwnableUpgradeable, TransferHelper {
     using SafeMath for uint;
     using SafeBEP20 for IBEP20;
 
@@ -110,31 +111,80 @@ contract Zap is OwnableUpgradeable {
     /* ========== External Functions ========== */
 
     function zapInTokenTo(address _from, uint amount, address _to, address receiver) public {
+        require(_from != _to, "identical from & to tokens");
         IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         _approveTokenIfNeeded(_from);
+
+        // lp -> x
         if (isFlip(_from)) {
-            // NOTE: We support every zap except flip <-> flip
-            IPancakePair pair = IPancakePair(_from);
-            address token0 = pair.token0();
-            address token1 = pair.token1();
-            ROUTER_V2.removeLiquidity(token0, token1, amount, 0, 0, address(this), block.timestamp);
-            _approveTokenIfNeeded(token0);
-            _approveTokenIfNeeded(token1);
-            _swap(token0, IBEP20(token0).balanceOf(address(this)), _to, receiver);
-            _swap(token1, IBEP20(token1).balanceOf(address(this)), _to, receiver);
+            IPancakePair fromPair = IPancakePair(_from);
+            address fromToken0 = fromPair.token0();
+            address fromToken1 = fromPair.token1();
+            ROUTER_V2.removeLiquidity(fromToken0, fromToken1, amount, 0, 0, address(this), block.timestamp);
+            uint fromToken0Amount = IBEP20(fromToken0).balanceOf(address(this));
+            uint fromToken1Amount = IBEP20(fromToken1).balanceOf(address(this));
+
+            _approveTokenIfNeeded(fromToken0);
+            _approveTokenIfNeeded(fromToken1);
+
+            // lp -> regular token
+            if (!isFlip(_to)) {
+                // A-X -> B
+                if (fromToken0 != _to) {
+                    _swap(fromToken0, fromToken0Amount, _to, receiver);
+                }
+                // X-A -> B
+                if (fromToken1 != _to) {
+                    _swap(fromToken1, fromToken1Amount, _to, receiver);
+                }
+
+                // if (fromToken0 == _to || fromToken1 == _to)
+                uint leftoverToAmount = IBEP20(_to).balanceOf(address(this));
+                if (leftoverToAmount > 0) {
+                  IBEP20(_to).safeTransfer(receiver, leftoverToAmount);
+                }
+            // lp -> lp
+            } else {
+                IPancakePair toPair = IPancakePair(_to);
+                address toToken0 = toPair.token0();
+                address toToken1 = toPair.token1();
+
+                // A-B -> A-C || A-B -> C-A
+                if (fromToken0 == toToken0 || fromToken0 == toToken1) {
+                    address other = fromToken0 == toToken0 ? toToken1 : toToken0;
+                    uint otherAmount = _swap(fromToken1, fromToken1Amount, other, address(this));
+                    _addLiquidity(fromToken0, other, fromToken0Amount, otherAmount, receiver);
+
+                // A-B -> B-C || A-B -> C-B
+                } else if (fromToken1 == toToken0 || fromToken1 == toToken1) {
+                    address other = fromToken1 == toToken0 ? toToken1 : toToken0;
+                    uint otherAmount = _swap(fromToken0, fromToken0Amount, other, address(this));
+                    _addLiquidity(fromToken1, other, fromToken1Amount, otherAmount, receiver);
+
+                // A-B -> C-D
+                } else {
+                  // NOTE: another solution would be to convert directly (A->C, B->D) and then add liquidity (C-D)
+                  uint bnbAmount = _swapTokenForBNB(fromToken0, fromToken0Amount, address(this));
+                  bnbAmount += _swapTokenForBNB(fromToken1, fromToken1Amount, address(this));
+                  _swapBNBToFlip(_to, bnbAmount, receiver);
+                }
+            }
             return;
         }
 
+        // regular token -> lp
         if (isFlip(_to)) {
-            IPancakePair pair = IPancakePair(_to);
-            address token0 = pair.token0();
-            address token1 = pair.token1();
-            if (_from == token0 || _from == token1) {
+            IPancakePair toPair = IPancakePair(_to);
+            address toToken0 = toPair.token0();
+            address toToken1 = toPair.token1();
+            // A -> A-B || B -> A-B
+            if (_from == toToken0 || _from == toToken1) {
                 // swap half amount for other
-                address other = _from == token0 ? token1 : token0;
+                address other = _from == toToken0 ? toToken1 : toToken0;
                 uint sellAmount = amount.div(2);
                 uint otherAmount = _swap(_from, sellAmount, other, address(this));
                 _addLiquidity(_from, other, amount.sub(sellAmount), otherAmount, receiver);
+            // A -> B-C
             } else {
                 uint bnbAmount = _swapTokenForBNB(_from, amount, address(this));
                 _swapBNBToFlip(_to, bnbAmount, receiver);
@@ -148,11 +198,15 @@ contract Zap is OwnableUpgradeable {
         zapInTokenTo(_from, amount, _to, msg.sender);
     }
 
+    function zapInTo(address _to, address _receiver) external payable {
+        _swapBNBToFlip(_to, msg.value, _receiver);
+    }
+
     function zapIn(address _to) external payable {
         _swapBNBToFlip(_to, msg.value, msg.sender);
     }
 
-    function zapOut(address _from, uint amount) external {
+    function zapInTokenToBNB(address _from, uint amount) external {
         IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         _approveTokenIfNeeded(_from);
 
@@ -163,9 +217,17 @@ contract Zap is OwnableUpgradeable {
             address token0 = pair.token0();
             address token1 = pair.token1();
             if (token0 == WBNB || token1 == WBNB) {
-                ROUTER_V2.removeLiquidityETH(token0 != WBNB ? token0 : token1, amount, 0, 0, msg.sender, block.timestamp);
+                address other = token0 == WBNB ? token1 : token0;
+                ROUTER_V2.removeLiquidityETH(other, amount, 0, 0, address(this), block.timestamp);
+                uint otherAmount = IBEP20(other).balanceOf(address(this));
+                _swapTokenForBNB(other, otherAmount, address(this));
+                safeTransferBNB(msg.sender, address(this).balance);
             } else {
-                ROUTER_V2.removeLiquidity(token0, token1, amount, 0, 0, msg.sender, block.timestamp);
+                ROUTER_V2.removeLiquidity(token0, token1, amount, 0, 0, address(this), block.timestamp);
+                uint token0Amount = IBEP20(token0).balanceOf(address(this));
+                uint token1Amount = IBEP20(token1).balanceOf(address(this));
+                _swapTokenForBNB(token0, token0Amount, msg.sender);
+                _swapTokenForBNB(token1, token1Amount, msg.sender);
             }
         }
     }

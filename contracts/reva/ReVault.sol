@@ -9,11 +9,12 @@ import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
 import "./interfaces/IRevaChef.sol";
 import "./interfaces/IRevaUserProxy.sol";
 import "./interfaces/IRevaUserProxyFactory.sol";
+import "../library/TransferHelper.sol";
 import "../library/ReentrancyGuard.sol";
 import "../library/interfaces/IWBNB.sol";
 import "../library/interfaces/IZap.sol";
 
-contract ReVault is OwnableUpgradeable, ReentrancyGuard {
+contract ReVault is OwnableUpgradeable, ReentrancyGuard, TransferHelper {
     using SafeMath for uint256;
     using SafeBEP20 for IBEP20;
 
@@ -26,8 +27,9 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
     IBEP20 private reva;
     IRevaChef public revaChef;
     IRevaUserProxyFactory public revaUserProxyFactory;
-    address revaFeeReceiver;
     IZap public zap;
+    address public revaFeeReceiver;
+    address public zapAndDeposit;
 
     uint public profitToReva;
     uint public profitToRevaStakers;
@@ -52,6 +54,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
 
     event SetProfitToReva(uint profitToReva);
     event SetProfitToRevaStakers(uint profitToRevaStakers);
+    event SetZapAndDeposit(address zapAndDepositAddress);
 
     function initialize(
         address _revaChefAddress,
@@ -102,8 +105,12 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
         address userProxyAddress = userProxyContractAddress[msg.sender];
         uint fromVaultTokenAmount = _withdrawFromUnderlyingVault(msg.sender, fromVault, _fromVid, _withdrawPayload);
 
-        IBEP20(fromVault.depositTokenAddress).safeTransfer(userProxyAddress, fromVaultTokenAmount);
-        IRevaUserProxy(userProxyAddress).callDepositVault(toVault.vaultAddress, toVault.depositTokenAddress, toVault.nativeTokenAddress, fromVaultTokenAmount, _depositAllPayload);
+        if (fromVault.depositTokenAddress == WBNB) {
+            IRevaUserProxy(userProxyAddress).callDepositVault{ value: fromVaultTokenAmount }(toVault.vaultAddress, toVault.depositTokenAddress, toVault.nativeTokenAddress, fromVaultTokenAmount, _depositAllPayload);
+        } else {
+            IBEP20(fromVault.depositTokenAddress).safeTransfer(userProxyAddress, fromVaultTokenAmount);
+            IRevaUserProxy(userProxyAddress).callDepositVault(toVault.vaultAddress, toVault.depositTokenAddress, toVault.nativeTokenAddress, fromVaultTokenAmount, _depositAllPayload);
+        }
 
         _handleDepositHarvest(toVault.nativeTokenAddress, msg.sender);
 
@@ -136,7 +143,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
 
     // some vaults such as bunny-wbnb accept BNB deposits rather than WBNB
     // this means we have to convert the withdrawn WBNB into BNB and then send it
-    function rebalanceDepositAllAsBNB(uint _fromVid, uint _toVid, bytes calldata _withdrawPayload, bytes calldata _depositAllPayload) external nonReentrant {
+    function rebalanceDepositAllAsWBNB(uint _fromVid, uint _toVid, bytes calldata _withdrawPayload, bytes calldata _depositAllPayload) external nonReentrant {
         require(_isApprovedWithdrawMethod(_fromVid, _withdrawPayload), "unapproved withdraw method");
         require(_isApprovedDepositMethod(_toVid, _depositAllPayload), "unapproved deposit method");
         require(_fromVid != _toVid, "identical vault indices");
@@ -150,8 +157,9 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
         address userProxyAddress = userProxyContractAddress[msg.sender];
 
         uint fromVaultTokenAmount = _withdrawFromUnderlyingVault(msg.sender, fromVault, _fromVid, _withdrawPayload);
-        IWBNB(WBNB).withdraw(fromVaultTokenAmount);
-        IRevaUserProxy(userProxyAddress).callDepositVault{value : fromVaultTokenAmount}(toVault.vaultAddress, toVault.depositTokenAddress, toVault.nativeTokenAddress, fromVaultTokenAmount, _depositAllPayload);
+        IWBNB(WBNB).deposit{ value: fromVaultTokenAmount }();
+        IBEP20(WBNB).safeTransfer(userProxyAddress, fromVaultTokenAmount);
+        IRevaUserProxy(userProxyAddress).callDepositVault(toVault.vaultAddress, toVault.depositTokenAddress, toVault.nativeTokenAddress, fromVaultTokenAmount, _depositAllPayload);
 
         _handleDepositHarvest(toVault.nativeTokenAddress, msg.sender);
 
@@ -174,15 +182,21 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
             _convertToReva(vault.nativeTokenAddress, vaultNativeTokenAmount, msg.sender);
         }
 
-        uint vaultDepositTokenAmount = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        uint vaultDepositTokenAmount;
+        if (vault.depositTokenAddress == WBNB) {
+            vaultDepositTokenAmount = address(this).balance;
+        }
+        else {
+            vaultDepositTokenAmount = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        }
+        
         if (vaultDepositTokenAmount > userPrincipal) {
             uint profitDistributed = _distributeProfit(vaultDepositTokenAmount.sub(userPrincipal), vault.depositTokenAddress);
             vaultDepositTokenAmount = vaultDepositTokenAmount.sub(profitDistributed);
 
             // If withdrawing WBNB, send back BNB
             if (vault.depositTokenAddress == WBNB) {
-                IWBNB(WBNB).withdraw(vaultDepositTokenAmount);
-                msg.sender.transfer(address(this).balance);
+                safeTransferBNB(msg.sender, address(this).balance);
             } else {
                 IBEP20(vault.depositTokenAddress).safeTransfer(msg.sender, vaultDepositTokenAmount);
             }
@@ -192,8 +206,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
         } else {
             // If withdrawing WBNB, send back BNB
             if (vault.depositTokenAddress == WBNB) {
-                IWBNB(WBNB).withdraw(vaultDepositTokenAmount);
-                msg.sender.transfer(address(this).balance);
+                safeTransferBNB(msg.sender, address(this).balance);
             } else {
                 IBEP20(vault.depositTokenAddress).safeTransfer(msg.sender, vaultDepositTokenAmount);
             }
@@ -208,6 +221,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
 
     function depositToVaultFor(uint _amount, uint _vid, bytes calldata _depositPayload, address _user) external nonReentrant payable {
         require(tx.origin == _user, "user must initiate tx");
+        require(msg.sender == zapAndDeposit, "Only zapAndDeposit may deposit for user");
         _depositToVault(_amount, _vid, _depositPayload, _user, msg.sender);
     }
 
@@ -228,7 +242,12 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
             _convertToReva(vault.nativeTokenAddress, nativeTokenProfit, msg.sender);
         }
 
-        uint depositTokenProfit = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        uint depositTokenProfit;
+        if (vault.depositTokenAddress == WBNB) {
+            depositTokenProfit = address(this).balance;
+        } else {
+            depositTokenProfit = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        }
         uint leftoverDepositTokenProfit = 0;
         if (depositTokenProfit > 0) {
             uint profitDistributed = _distributeProfit(depositTokenProfit, vault.depositTokenAddress);
@@ -236,8 +255,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
 
             // If withdrawing WBNB, send back BNB
             if (vault.depositTokenAddress == WBNB) {
-                IWBNB(WBNB).withdraw(leftoverDepositTokenProfit);
-                msg.sender.transfer(address(this).balance);
+                safeTransferBNB(msg.sender, address(this).balance);
             } else {
                 IBEP20(vault.depositTokenAddress).safeTransfer(msg.sender, leftoverDepositTokenProfit);
             }
@@ -248,9 +266,7 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
         return (leftoverDepositTokenProfit, postRevaBalance.sub(prevRevaBalance));
     }
 
-	receive() external payable {
-		require(msg.sender == WBNB, "receive only from WBNB contract");
-	}
+	receive() external payable {}
 
     /* ========== Private Functions ========== */
 
@@ -285,7 +301,12 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
 
         IRevaUserProxy(userProxyAddress).callVault(vault.vaultAddress, vault.depositTokenAddress, vault.nativeTokenAddress, _payload);
 
-        uint depositTokenAmount = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        uint depositTokenAmount;
+        if (vault.depositTokenAddress == WBNB) {
+            depositTokenAmount = address(this).balance;
+        } else {
+            depositTokenAmount = IBEP20(vault.depositTokenAddress).balanceOf(address(this));
+        }
         uint vaultNativeTokenAmount = IBEP20(vault.nativeTokenAddress).balanceOf(address(this));
 
         if (vaultNativeTokenAmount > 0) {
@@ -313,6 +334,10 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
     }
 
     function _convertToReva(address fromToken, uint amount, address to) private {
+        if (fromToken == WBNB) {
+            zap.zapInTo{ value: amount }(address(reva), to);
+            return;
+        }
         if (!haveApprovedTokenToZap[fromToken]) {
             IBEP20(fromToken).approve(address(zap), uint(~0));
             haveApprovedTokenToZap[fromToken] = true;
@@ -394,5 +419,10 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard {
         require(_profitToRevaStakers <= MAX_PROFIT_TO_REVA_STAKERS, "MAX_PROFIT_TO_REVA_STAKERS");
         profitToRevaStakers = _profitToRevaStakers;
         emit SetProfitToRevaStakers(_profitToRevaStakers);
+    }
+
+    function setZapAndDeposit(address _zapAndDeposit) external onlyOwner {
+        zapAndDeposit = _zapAndDeposit;
+        emit SetZapAndDeposit(_zapAndDeposit);
     }
 }

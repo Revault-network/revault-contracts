@@ -6,6 +6,7 @@ import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
 import "@pancakeswap/pancake-swap-lib/contracts/access/Ownable.sol";
 import "./interfaces/IRevaUserProxy.sol";
+import "../library/TransferHelper.sol";
 import "../library/interfaces/IWBNB.sol";
 
 // This contract performs withdraws/deposits on behalf
@@ -14,7 +15,7 @@ import "../library/interfaces/IWBNB.sol";
 // they may do so without paying a fee. Otherwise, every time
 // the central ReVault contract would deposit into a vault,
 // the 3 days would be reset.
-contract RevaUserProxy is IRevaUserProxy, Ownable {
+contract RevaUserProxy is IRevaUserProxy, Ownable, TransferHelper {
     using SafeMath for uint;
     using SafeBEP20 for IBEP20;
 
@@ -30,13 +31,20 @@ contract RevaUserProxy is IRevaUserProxy, Ownable {
         (bool success,) = _vaultAddress.call{value : 0}(_payload);
         require(success, "vault call");
 
-        if (address(this).balance > 0 && _depositTokenAddress == WBNB) {
-            IWBNB(WBNB).deposit{ value: address(this).balance }();
-        }
         uint depositTokenAmount = IBEP20(_depositTokenAddress).balanceOf(address(this));
         uint vaultTokenAmount = IBEP20(_vaultNativeTokenAddress).balanceOf(address(this));
-        if (depositTokenAmount > 0) {
-            IBEP20(_depositTokenAddress).safeTransfer(msg.sender, depositTokenAmount);
+        if (_depositTokenAddress == WBNB) {
+            if (depositTokenAmount > 0) {
+                IWBNB(WBNB).withdraw(depositTokenAmount);
+            }
+            if (address(this).balance > 0) {
+                // transfer BNB like this to not run out of gas with zeppelin upgradeable contract
+                safeTransferBNB(msg.sender, address(this).balance);
+            }
+        } else {
+            if (depositTokenAmount > 0) {
+                IBEP20(_depositTokenAddress).safeTransfer(msg.sender, depositTokenAmount);
+            }
         }
         if (vaultTokenAmount > 0) {
             IBEP20(_vaultNativeTokenAddress).safeTransfer(msg.sender, vaultTokenAmount);
