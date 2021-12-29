@@ -8,6 +8,7 @@ import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
 import "../library/ReentrancyGuard.sol";
 import "./interfaces/IvRevaToken.sol";
 import "./interfaces/IRevaToken.sol";
+import "./interfaces/IRevaAutoCompoundPool.sol";
 
 contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
     using SafeMath for uint;
@@ -54,6 +55,10 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
     uint public constant EARLY_WITHDRAWAL_FEE_PRECISION = 1000000;
     uint public constant MAX_EARLY_WITHDRAWAL_FEE = 500000;
 
+    // variables for autocompounding upgrade
+    address public revaAutoCompoundPool;
+    mapping (uint => mapping (address => bool)) public userIsCompounding;
+
     event VRevaMinted(address indexed user, uint indexed pid, uint amount);
     event VRevaBurned(address indexed user, uint indexed pid, uint amount);
     event Deposit(address indexed user, uint indexed pid, uint amount);
@@ -65,6 +70,8 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
     event SetRevaPerBlock(uint revaPerBlock);
     event SetEarlyWithdrawalFee(uint earlyWithdrawalFee);
     event SetPool(uint pid, uint allocPoint);
+    event SetRevaAutoCompoundPool(address _revaAutoCompoundPool);
+    event CompoundingEnabled(address indexed user, uint pid, bool enabled);
 
     function initialize(
         address _revaToken,
@@ -129,6 +136,11 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
 
     function poolLength() external view returns (uint) {
         return poolInfo.length;
+    }
+
+    modifier revaAutoCompoundPoolOnly {
+        require(msg.sender == revaAutoCompoundPool, "AUTO COMPOUND POOL ONLY");
+        _;
     }
 
     /* ========== External Functions ========== */
@@ -201,6 +213,7 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
 
     // Deposit REVA tokens for REVA allocation.
     function deposit(uint _pid, uint _amount) external nonReentrant {
+        require(!userIsCompounding[_pid][msg.sender], "Can't deposit when compounding");
         PoolInfo storage pool = poolInfo[_pid];
         UserPoolInfo storage user = userPoolInfo[_pid][msg.sender];
         updatePool(_pid);
@@ -323,6 +336,106 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
         }
     }
 
+    function enterCompoundingPosition(uint _pid, address _user) external nonReentrant revaAutoCompoundPoolOnly {
+        updatePool(_pid);
+        PoolInfo storage pool = poolInfo[_pid];
+        UserPoolInfo storage user = userPoolInfo[_pid][_user];
+        UserPoolInfo storage revaAutoCompoundInfo = userPoolInfo[_pid][revaAutoCompoundPool];
+        uint migrationAmount = user.amount;
+
+        if (user.amount > 0) {
+            _claimPendingMintReward(_pid, _user);
+            _claimPendingFeeReward(_pid, _user);
+        }
+        if (revaAutoCompoundInfo.amount > 0) {
+            _claimPendingMintReward(_pid, revaAutoCompoundPool);
+            _claimPendingFeeReward(_pid, revaAutoCompoundPool);
+        }
+
+        user.amount = 0;
+        revaAutoCompoundInfo.amount = revaAutoCompoundInfo.amount.add(migrationAmount);
+        revaAutoCompoundInfo.rewardDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShare).div(1e12);
+        revaAutoCompoundInfo.rewardFeeDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShareFromFees).div(1e12);
+        revaAutoCompoundInfo.timeDeposited = block.timestamp;
+
+        userIsCompounding[_pid][_user] = true;
+        emit CompoundingEnabled(_user, _pid, true);
+
+        uint vRevaToMint = pool.vRevaMultiplier.mul(migrationAmount);
+        IvRevaToken(vRevaToken).mint(revaAutoCompoundPool, vRevaToMint);
+        emit VRevaMinted(_user, _pid, vRevaToMint);
+        IvRevaToken(vRevaToken).burn(_user, vRevaToMint);
+        emit VRevaBurned(_user, _pid, vRevaToMint);
+    }
+
+    function exitCompoundingPosition(uint _pid, uint _amount, address _user) external nonReentrant revaAutoCompoundPoolOnly {
+        updatePool(_pid);
+        PoolInfo storage pool = poolInfo[_pid];
+        UserPoolInfo storage user = userPoolInfo[_pid][_user];
+        UserPoolInfo storage revaAutoCompoundInfo = userPoolInfo[_pid][revaAutoCompoundPool];
+
+        if (user.amount > 0) {
+            _claimPendingMintReward(_pid, _user);
+            _claimPendingFeeReward(_pid, _user);
+        }
+        if (revaAutoCompoundInfo.amount > 0) {
+            _claimPendingMintReward(_pid, revaAutoCompoundPool);
+            _claimPendingFeeReward(_pid, revaAutoCompoundPool);
+        }
+
+        revaAutoCompoundInfo.amount = revaAutoCompoundInfo.amount.sub(_amount);
+        revaAutoCompoundInfo.rewardDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShare).div(1e12);
+        revaAutoCompoundInfo.rewardFeeDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShareFromFees).div(1e12);
+
+        user.amount = user.amount.add(_amount);
+        user.rewardDebt = user.amount.mul(pool.accRevaPerShare).div(1e12);
+        user.rewardFeeDebt = user.amount.mul(pool.accRevaPerShareFromFees).div(1e12);
+        user.timeDeposited = block.timestamp;
+
+        userIsCompounding[_pid][_user] = false;
+        emit CompoundingEnabled(_user, _pid, false);
+
+        uint vRevaToMint = pool.vRevaMultiplier.mul(_amount);
+        IvRevaToken(vRevaToken).mint(_user, vRevaToMint);
+        emit VRevaMinted(_user, _pid, vRevaToMint);
+        IvRevaToken(vRevaToken).burn(revaAutoCompoundPool, vRevaToMint);
+        emit VRevaBurned(revaAutoCompoundPool, _pid, vRevaToMint);
+    }
+
+    function depositToCompoundingPosition(uint _pid, uint _amount) external {
+        updatePool(_pid);
+        PoolInfo storage pool = poolInfo[_pid];
+        UserPoolInfo storage user = userPoolInfo[_pid][msg.sender];
+        UserPoolInfo storage revaAutoCompoundInfo = userPoolInfo[_pid][revaAutoCompoundPool];
+
+        require(user.amount == 0, "Can't compound when deposited");
+        require(_amount > 0, "Must deposit non zero amount");
+
+        if (revaAutoCompoundInfo.amount > 0) {
+            _claimPendingMintReward(_pid, revaAutoCompoundPool);
+            _claimPendingFeeReward(_pid, revaAutoCompoundPool);
+        }
+
+        uint before = IBEP20(revaToken).balanceOf(address(this));
+        IBEP20(revaToken).safeTransferFrom(address(msg.sender), address(this), _amount);
+        uint post = IBEP20(revaToken).balanceOf(address(this));
+        uint finalAmount = post.sub(before);
+        uint vRevaToMint = pool.vRevaMultiplier.mul(finalAmount);
+        IvRevaToken(vRevaToken).mint(revaAutoCompoundPool, vRevaToMint);
+        emit VRevaMinted(revaAutoCompoundPool, _pid, vRevaToMint);
+
+        revaAutoCompoundInfo.amount = revaAutoCompoundInfo.amount.add(finalAmount);
+        revaAutoCompoundInfo.timeDeposited = block.timestamp;
+        revaAutoCompoundInfo.rewardDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShare).div(1e12);
+        revaAutoCompoundInfo.rewardFeeDebt = revaAutoCompoundInfo.amount.mul(pool.accRevaPerShareFromFees).div(1e12);
+
+        pool.totalSupply = pool.totalSupply.add(finalAmount);
+
+        userIsCompounding[_pid][msg.sender] = true;
+
+        IRevaAutoCompoundPool(revaAutoCompoundPool).notifyDeposited(_pid, finalAmount, msg.sender);
+    }
+
     // Add a new lp to the pool. Can only be called by the owner.
     // XXX DO NOT add the same LP token more than once. Rewards will be messed up if you do.
     function add(uint _allocPoint, uint _vRevaMultiplier, uint _timeLocked) external onlyOwner {
@@ -362,6 +475,11 @@ contract RevaStakingPool is OwnableUpgradeable, ReentrancyGuard {
         require(_earlyWithdrawalFee <= MAX_EARLY_WITHDRAWAL_FEE, "MAX_EARLY_WITHDRAWAL_FEE");
         earlyWithdrawalFee = _earlyWithdrawalFee;
         emit SetEarlyWithdrawalFee(earlyWithdrawalFee);
+    }
+
+    function setRevaAutoCompoundPool(address _revaAutoCompoundPool) external onlyOwner {
+        revaAutoCompoundPool = _revaAutoCompoundPool;
+        emit SetRevaAutoCompoundPool(_revaAutoCompoundPool);
     }
 
     function _claimPendingMintReward(uint _pid, address _user) private {

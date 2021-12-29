@@ -34,10 +34,14 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     uint256 public revaPerBlock; 
     // treasury
     address public treasury;
+    // admin
+    address public admin;
     // REVA tokens created per block for treasury.
     uint256 public revaTreasuryPerBlock; 
     // checkpoint
     uint256 public lastTreasuryRewardBlock;
+    // start block
+    uint256 public startBlock;
     // The TVL of tokens combined
     uint256 public totalRevaultTvlBusd;
     // array of tokens deposited
@@ -53,8 +57,10 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     event RevaRewardPaid(address indexed user, address indexed token, uint amount);
     event TreasuryRewardClaimed(uint amount);
     event SetRevaPerBlock(uint revaPerBlock);
+    event SetRevaTreasuryPerBlock(uint revaTreasuryPerBlock);
     event SetRevault(address revaultAddress);
     event SetTreasury(address treasury);
+    event SetAdmin(address admin);
     event TokenAdded(address token);
     event TokenRewardsDisabled(address token);
     event TokenRewardsEnabled(address token);
@@ -65,7 +71,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         uint256 _revaPerBlock,
         uint256 _revaTreasuryPerBlock,
         address _treasury,
-        uint256 _startBlock
+        uint256 _startBlock,
+        address _admin
     ) external initializer {
         __Ownable_init();
         require(_startBlock >= block.number, "Start block must be in future");
@@ -75,6 +82,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         revaTreasuryPerBlock = _revaTreasuryPerBlock;
         treasury = _treasury;
         lastTreasuryRewardBlock = _startBlock;
+        startBlock = _startBlock;
+        admin = _admin;
     }
 
     /* ========== MODIFIERS ========== */
@@ -87,6 +96,11 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
 
     modifier onlyTreasury {
         require(msg.sender == treasury, "treasury only");
+        _;
+    }
+
+    modifier onlyAdmin {
+        require(msg.sender == admin, "admin only");
         _;
     }
 
@@ -165,19 +179,19 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
 
         // NOTE: this is done so that a new token won't get too many rewards
         if (tokenInfo.lastRewardBlock == 0) {
-            tokenInfo.lastRewardBlock = block.number;
+            tokenInfo.lastRewardBlock = block.number > startBlock ? block.number : startBlock;
             tokenInfo.rewardsEnabled = true;
             supportedTokens.push(_tokenAddress);
             emit TokenAdded(_tokenAddress);
-        }
+        } else {
+            if (tokenInfo.totalPrincipal > 0 && totalRevaultTvlBusd > 0 && tokenInfo.rewardsEnabled) {
+                uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
+                uint256 revaReward = multiplier.mul(revaPerBlock).mul(tokenInfo.tvlBusd).div(totalRevaultTvlBusd);
+                tokenInfo.accRevaPerToken = tokenInfo.accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
+            }
 
-        if (tokenInfo.totalPrincipal > 0 && totalRevaultTvlBusd > 0 && tokenInfo.rewardsEnabled) {
-            uint256 multiplier = (block.number).sub(tokenInfo.lastRewardBlock);
-            uint256 revaReward = multiplier.mul(revaPerBlock).mul(tokenInfo.tvlBusd).div(totalRevaultTvlBusd);
-            tokenInfo.accRevaPerToken = tokenInfo.accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
+            tokenInfo.lastRewardBlock = block.number;
         }
-
-        tokenInfo.lastRewardBlock = block.number;
 
         if (_isDeposit) tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.add(_amount);
         else tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.sub(_amount);
@@ -197,7 +211,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit TreasuryRewardClaimed(pendingRewards);
     }
 
-    function disableTokenRewards(uint tokenIdx) external onlyOwner {
+    function disableTokenRewards(uint tokenIdx) external onlyAdmin {
         address tokenAddress = supportedTokens[tokenIdx];
         TokenInfo storage tokenInfo = tokens[tokenAddress];
         require(tokenInfo.rewardsEnabled, "token rewards already disabled");
@@ -210,7 +224,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit TokenRewardsDisabled(tokenAddress);
     }
 
-    function enableTokenRewards(uint tokenIdx) external onlyOwner {
+    function enableTokenRewards(uint tokenIdx) external onlyAdmin {
         address tokenAddress = supportedTokens[tokenIdx];
         TokenInfo storage tokenInfo = tokens[tokenAddress];
         require(!tokenInfo.rewardsEnabled, "token rewards already enabled");
@@ -229,6 +243,11 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit SetRevaPerBlock(_revaPerBlock);
     }
 
+    function setRevaTreasuryPerBlock(uint256 _revaTreasuryPerBlock) external onlyOwner {
+        revaTreasuryPerBlock = _revaTreasuryPerBlock;
+        emit SetRevaTreasuryPerBlock(_revaTreasuryPerBlock);
+    }
+
     function setRevault(address _revaultAddress) external onlyOwner {
         revaultAddress = _revaultAddress;
         emit SetRevault(_revaultAddress);
@@ -237,6 +256,11 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     function setTreasury(address _treasury) external onlyOwner {
         treasury = _treasury;
         emit SetTreasury(_treasury);
+    }
+
+    function setAdmin(address _admin) external onlyOwner {
+        admin = _admin;
+        emit SetAdmin(_admin);
     }
 
     function notifyDeposited(address user, address token, uint amount) external override onlyRevault  {

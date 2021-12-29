@@ -2,11 +2,9 @@
 pragma solidity ^0.6.12;
 
 // vault that controls a single token
-interface IBunnyVault {
+interface IBunnyVaultQubit {
 
     // Read
-
-    function keeper() external view returns (address);
 
     function balanceOf(address _account) external view returns (uint256);
 
@@ -28,6 +26,13 @@ interface IBunnyVault {
 
     function totalSupply() external view returns (uint256);
 
-    // for tests, callable only by keeper
-    function harvest() external;
+    // Write
+
+    function deposit(uint256 _amount) external payable;
+
+    function getReward() external;
+
+    function withdraw(uint256 _amountTokens) external;
+
+    function withdrawAll() external;
 }

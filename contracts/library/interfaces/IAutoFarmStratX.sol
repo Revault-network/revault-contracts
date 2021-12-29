@@ -10,4 +10,7 @@ interface IAutoFarmStratX {
     function entranceFeeFactor() external view returns (uint256);
     function entranceFeeFactorMax() external view returns (uint256);
     function entranceFeeFactorLL() external view returns (uint256);
+
+    function wantLockedTotal() external view returns (uint256);
+    function sharesTotal() external view returns (uint256);
 }

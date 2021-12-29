@@ -17,6 +17,8 @@ interface IAutoFarm {
         address strat;              // Strategy address that will auto compound want tokens
     }
 
+    function totalAllocPoint() external view returns (uint256);
+
     function userInfo(uint _pid, address _userAddress) external view returns (UserInfo memory);
 
     function poolInfo(uint _pid) external view returns (PoolInfo memory);
@@ -28,4 +30,6 @@ interface IAutoFarm {
     function withdrawAll(uint256 _pid) external;
 
     function withdraw(uint256 _pid, uint256 _amount) external;
+
+    function pendingAUTO(uint256 _pid, address _userAddress) external view returns (uint256);
 }

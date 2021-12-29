@@ -14,4 +14,7 @@ interface IAutoFarmStratX2PCS {
     function withdrawFeeFactor() external view returns (uint256);
     function withdrawFeeFactorMax() external view returns (uint256);
     function withdrawFeeFactorLL() external view returns (uint256);
+
+    function wantLockedTotal() external view returns (uint256);
+    function sharesTotal() external view returns (uint256);
 }
