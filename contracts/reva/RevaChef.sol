@@ -52,6 +52,11 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
     // mapping token address => token info
     mapping (address => TokenInfo) public tokens;
 
+    uint256 public revaHoldingsMultiplier;
+    // mapping token address => user address => pending reva burn 
+    mapping (address => mapping (address => uint256)) public userPendingRevaBurn;
+    address private constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
     event NotifyDeposited(address indexed user, address indexed token, uint amount);
     event NotifyWithdrawn(address indexed user, address indexed token, uint amount);
     event RevaRewardPaid(address indexed user, address indexed token, uint amount);
@@ -99,7 +104,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         _;
     }
 
-    modifier onlyAdmin {
+    modifier onlyOwnerOrAdmin {
         require(msg.sender == admin, "admin only");
         _;
     }
@@ -117,7 +122,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
             accRevaPerToken = accRevaPerToken.add(revaReward.mul(1e12).div(tokenInfo.totalPrincipal));
         }
 
-        return _calcPending(accRevaPerToken, _tokenAddress, _user);
+        (uint pendingReward,) = _calcPending(accRevaPerToken, _tokenAddress, _user);
+        return pendingReward;
     }
 
     function claim(address token) external override {
@@ -129,11 +135,13 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         RevaultUserInfo storage revaultUserInfo = revaultUsers[token][to];
         TokenInfo memory tokenInfo = tokens[token];
 
-        uint pending = _calcPending(tokenInfo.accRevaPerToken, token, to);
+        (uint pendingReward, uint pendingBurn) = _calcPending(tokenInfo.accRevaPerToken, token, to);
+        userPendingRevaBurn[token][to] = 0;
         revaultUserInfo.pending = 0;
         revaultUserInfo.rewardPaid = revaultUserInfo.balance.mul(tokenInfo.accRevaPerToken).div(1e12);
-        reva.mint(to, pending);
-        emit RevaRewardPaid(to, token, pending);
+        reva.mint(to, pendingReward);
+        reva.mint(DEAD, pendingBurn);
+        emit RevaRewardPaid(to, token, pendingReward);
     }
 
     function updateAllTvls() external {
@@ -179,6 +187,8 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
 
         // NOTE: this is done so that a new token won't get too many rewards
         if (tokenInfo.lastRewardBlock == 0) {
+            // only revault contract can add new tokens, dos protection
+            require(msg.sender == revaultAddress, "ORV");
             tokenInfo.lastRewardBlock = block.number > startBlock ? block.number : startBlock;
             tokenInfo.rewardsEnabled = true;
             supportedTokens.push(_tokenAddress);
@@ -197,9 +207,37 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         else tokenInfo.totalPrincipal = tokenInfo.totalPrincipal.sub(_amount);
     }
 
-    function _calcPending(uint256 accRevaPerToken, address _tokenAddress, address _user) private view returns (uint256) {
+    function _calcPending(uint256 accRevaPerToken, address _tokenAddress, address _user) private view returns (uint256, uint256) {
         RevaultUserInfo memory revaultUserInfo = revaultUsers[_tokenAddress][_user];
-        return revaultUserInfo.balance.mul(accRevaPerToken).div(1e12).sub(revaultUserInfo.rewardPaid).add(revaultUserInfo.pending);
+        TokenInfo memory tokenInfo = tokens[_tokenAddress];
+
+        uint256 revaBalance = reva.balanceOf(_user);
+        uint256 maxTvlRewards = revaBalance.mul(revaHoldingsMultiplier);
+        uint256 userTokenTvlBusd = revaultUserInfo.balance.mul(tokenInfo.tvlBusd).div(tokenInfo.totalPrincipal);
+        return _calcRewards(accRevaPerToken, _tokenAddress, _user, maxTvlRewards, userTokenTvlBusd);
+    }
+
+    function _calcRewards(
+        uint256 accRevaPerToken,
+        address _tokenAddress,
+        address _user,
+        uint256 _maxTvlRewards,
+        uint256 _userTokenTvlBusd
+    ) private view returns (uint256, uint256) {
+        RevaultUserInfo memory revaultUserInfo = revaultUsers[_tokenAddress][_user];
+        uint256 pendingBurn = userPendingRevaBurn[_tokenAddress][_user];
+
+        uint256 newReward = revaultUserInfo.balance.mul(accRevaPerToken).div(1e12).sub(revaultUserInfo.rewardPaid);
+        // if user has enough reva holdings to get max rewards, give full rewards
+        if (_maxTvlRewards >= _userTokenTvlBusd) {
+            uint256 finalReward = newReward.add(revaultUserInfo.pending);
+            return (finalReward, pendingBurn);
+        } else {
+            uint256 cappedNewReward = newReward.mul(_maxTvlRewards).div(_userTokenTvlBusd);
+            uint256 finalReward = cappedNewReward.add(revaultUserInfo.pending);
+            uint256 finalPendingBurn = newReward.sub(cappedNewReward).add(pendingBurn);
+            return (finalReward, finalPendingBurn);
+        }
     }
 
     /* ========== RESTRICTED FUNCTIONS ========== */
@@ -211,7 +249,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit TreasuryRewardClaimed(pendingRewards);
     }
 
-    function disableTokenRewards(uint tokenIdx) external onlyAdmin {
+    function disableTokenRewards(uint tokenIdx) external onlyOwnerOrAdmin {
         address tokenAddress = supportedTokens[tokenIdx];
         TokenInfo storage tokenInfo = tokens[tokenAddress];
         require(tokenInfo.rewardsEnabled, "token rewards already disabled");
@@ -224,7 +262,7 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit TokenRewardsDisabled(tokenAddress);
     }
 
-    function enableTokenRewards(uint tokenIdx) external onlyAdmin {
+    function enableTokenRewards(uint tokenIdx) external onlyOwnerOrAdmin {
         address tokenAddress = supportedTokens[tokenIdx];
         TokenInfo storage tokenInfo = tokens[tokenAddress];
         require(!tokenInfo.rewardsEnabled, "token rewards already enabled");
@@ -258,9 +296,13 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         emit SetTreasury(_treasury);
     }
 
-    function setAdmin(address _admin) external onlyOwner {
+    function setAdmin(address _admin) external onlyOwnerOrAdmin {
         admin = _admin;
         emit SetAdmin(_admin);
+    }
+
+    function setRevaHoldingsMultiplier(uint256 _revaHoldingsMultiplier) external onlyOwnerOrAdmin {
+        revaHoldingsMultiplier = _revaHoldingsMultiplier;
     }
 
     function notifyDeposited(address user, address token, uint amount) external override onlyRevault  {
@@ -268,8 +310,9 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         RevaultUserInfo storage revaultUserInfo = revaultUsers[token][user];
         TokenInfo memory tokenInfo = tokens[token];
 
-        uint pending = _calcPending(tokenInfo.accRevaPerToken, token, user);
-        revaultUserInfo.pending = pending;
+        (uint pendingReward, uint pendingBurn) = _calcPending(tokenInfo.accRevaPerToken, token, user);
+        userPendingRevaBurn[token][user] = pendingBurn;
+        revaultUserInfo.pending = pendingReward;
         revaultUserInfo.balance = revaultUserInfo.balance.add(amount);
         revaultUserInfo.rewardPaid = revaultUserInfo.balance.mul(tokenInfo.accRevaPerToken).div(1e12);
         emit NotifyDeposited(user, token, amount);
@@ -280,8 +323,9 @@ contract RevaChef is OwnableUpgradeable, IRevaChef {
         RevaultUserInfo storage revaultUserInfo = revaultUsers[token][user];
         TokenInfo memory tokenInfo = tokens[token];
 
-        uint pending = _calcPending(tokenInfo.accRevaPerToken, token, user);
-        revaultUserInfo.pending = pending;
+        (uint pendingReward, uint pendingBurn) = _calcPending(tokenInfo.accRevaPerToken, token, user);
+        userPendingRevaBurn[token][user] = pendingBurn;
+        revaultUserInfo.pending = pendingReward;
         revaultUserInfo.balance = revaultUserInfo.balance.sub(amount);
         revaultUserInfo.rewardPaid = revaultUserInfo.balance.mul(tokenInfo.accRevaPerToken).div(1e12);
         emit NotifyWithdrawn(user, token, amount);

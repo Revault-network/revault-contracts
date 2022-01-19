@@ -579,8 +579,12 @@ contract ReVault is OwnableUpgradeable, ReentrancyGuard, TransferHelper {
         uint profitToRevaTokens = profitTokens.mul(profitToReva).div(PROFIT_DISTRIBUTION_PRECISION);
         uint profitToRevaStakersTokens = profitTokens.mul(profitToRevaStakers).div(PROFIT_DISTRIBUTION_PRECISION);
         
-        _convertToReva(depositTokenAddress, profitToRevaTokens, msg.sender);
-        _convertToReva(depositTokenAddress, profitToRevaStakersTokens, revaFeeReceiver);
+        if (profitToRevaTokens > 0) {
+            _convertToReva(depositTokenAddress, profitToRevaTokens, msg.sender);
+        }
+        if (profitToRevaStakersTokens > 0) {
+            _convertToReva(depositTokenAddress, profitToRevaStakersTokens, revaFeeReceiver);
+        }
 
         return profitToRevaTokens.add(profitToRevaStakersTokens);
     }

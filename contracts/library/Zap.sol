@@ -74,7 +74,7 @@ contract Zap is OwnableUpgradeable, TransferHelper {
         return routePairAddresses[_address];
     }
 
-    function getBUSDValue(address _token, uint _amount) external view returns (uint) {
+    function getBUSDValue(address _token, uint _amount) public view returns (uint) {
         if (isFlip(_token)) {
             IPancakePair pair = IPancakePair(_token);
             address token0 = pair.token0();
@@ -86,7 +86,9 @@ contract Zap is OwnableUpgradeable, TransferHelper {
                 address busdWbnbPair = FACTORY.getPair(BUSD, WBNB);
                 return IBEP20(BUSD).balanceOf(busdWbnbPair).mul(wbnbAmount).mul(2).div(IBEP20(WBNB).balanceOf(busdWbnbPair));
             } else {
-                require(false, "throw");
+                uint token0Amount = IBEP20(token0).balanceOf(_token).mul(_amount).div(IBEP20(_token).totalSupply());
+                uint token1Amount = IBEP20(token1).balanceOf(_token).mul(_amount).div(IBEP20(_token).totalSupply());
+                return getBUSDValue(token0, token0Amount).add(getBUSDValue(token1, token1Amount));
             }
         } else {
             if (_token == WBNB) {
@@ -114,7 +116,50 @@ contract Zap is OwnableUpgradeable, TransferHelper {
         require(_from != _to, "identical from & to tokens");
         IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
         _approveTokenIfNeeded(_from);
+        _zapInTokenTo(_from, amount, _to, receiver);
+    }
 
+    function zapInToken(address _from, uint amount, address _to) external {
+        zapInTokenTo(_from, amount, _to, msg.sender);
+    }
+
+    function zapInTo(address _to, address _receiver) external payable {
+        _swapBNBToFlip(_to, msg.value, _receiver);
+    }
+
+    function zapIn(address _to) external payable {
+        _swapBNBToFlip(_to, msg.value, msg.sender);
+    }
+
+    function zapInTokenToBNB(address _from, uint amount) external {
+        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
+        _approveTokenIfNeeded(_from);
+
+        if (!isFlip(_from)) {
+            _swapTokenForBNB(_from, amount, msg.sender);
+        } else {
+            IPancakePair pair = IPancakePair(_from);
+            address token0 = pair.token0();
+            address token1 = pair.token1();
+            if (token0 == WBNB || token1 == WBNB) {
+                address other = token0 == WBNB ? token1 : token0;
+                ROUTER_V2.removeLiquidityETH(other, amount, 0, 0, address(this), block.timestamp);
+                uint otherAmount = IBEP20(other).balanceOf(address(this));
+                _swapTokenForBNB(other, otherAmount, address(this));
+                safeTransferBNB(msg.sender, address(this).balance);
+            } else {
+                ROUTER_V2.removeLiquidity(token0, token1, amount, 0, 0, address(this), block.timestamp);
+                uint token0Amount = IBEP20(token0).balanceOf(address(this));
+                uint token1Amount = IBEP20(token1).balanceOf(address(this));
+                _swapTokenForBNB(token0, token0Amount, msg.sender);
+                _swapTokenForBNB(token1, token1Amount, msg.sender);
+            }
+        }
+    }
+
+    /* ========== Private Functions ========== */
+
+    function _zapInTokenTo(address _from, uint amount, address _to, address receiver) internal {
         // lp -> x
         if (isFlip(_from)) {
             IPancakePair fromPair = IPancakePair(_from);
@@ -163,10 +208,17 @@ contract Zap is OwnableUpgradeable, TransferHelper {
 
                 // A-B -> C-D
                 } else {
-                  // NOTE: another solution would be to convert directly (A->C, B->D) and then add liquidity (C-D)
-                  uint bnbAmount = _swapTokenForBNB(fromToken0, fromToken0Amount, address(this));
-                  bnbAmount += _swapTokenForBNB(fromToken1, fromToken1Amount, address(this));
-                  _swapBNBToFlip(_to, bnbAmount, receiver);
+                    if (fromToken0 == WBNB || fromToken1 == WBNB) {
+                        address other = fromToken0 == WBNB ? fromToken1 : fromToken0;
+                        uint wbnbAmount = fromToken0 == WBNB ? fromToken0Amount : fromToken1Amount;
+                        _swap(WBNB, wbnbAmount, other, address(this));
+                        uint otherAmount = IBEP20(other).balanceOf(address(this));
+                        _zapInTokenTo(other, otherAmount, _to, receiver);
+                    } else {
+                        uint bnbAmount = _swapTokenForBNB(fromToken0, fromToken0Amount, address(this));
+                        bnbAmount += _swapTokenForBNB(fromToken1, fromToken1Amount, address(this));
+                        _swapBNBToFlip(_to, bnbAmount, receiver);
+                    }
                 }
             }
             return;
@@ -194,45 +246,6 @@ contract Zap is OwnableUpgradeable, TransferHelper {
         }
     }
 
-    function zapInToken(address _from, uint amount, address _to) external {
-        zapInTokenTo(_from, amount, _to, msg.sender);
-    }
-
-    function zapInTo(address _to, address _receiver) external payable {
-        _swapBNBToFlip(_to, msg.value, _receiver);
-    }
-
-    function zapIn(address _to) external payable {
-        _swapBNBToFlip(_to, msg.value, msg.sender);
-    }
-
-    function zapInTokenToBNB(address _from, uint amount) external {
-        IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
-        _approveTokenIfNeeded(_from);
-
-        if (!isFlip(_from)) {
-            _swapTokenForBNB(_from, amount, msg.sender);
-        } else {
-            IPancakePair pair = IPancakePair(_from);
-            address token0 = pair.token0();
-            address token1 = pair.token1();
-            if (token0 == WBNB || token1 == WBNB) {
-                address other = token0 == WBNB ? token1 : token0;
-                ROUTER_V2.removeLiquidityETH(other, amount, 0, 0, address(this), block.timestamp);
-                uint otherAmount = IBEP20(other).balanceOf(address(this));
-                _swapTokenForBNB(other, otherAmount, address(this));
-                safeTransferBNB(msg.sender, address(this).balance);
-            } else {
-                ROUTER_V2.removeLiquidity(token0, token1, amount, 0, 0, address(this), block.timestamp);
-                uint token0Amount = IBEP20(token0).balanceOf(address(this));
-                uint token1Amount = IBEP20(token1).balanceOf(address(this));
-                _swapTokenForBNB(token0, token0Amount, msg.sender);
-                _swapTokenForBNB(token1, token1Amount, msg.sender);
-            }
-        }
-    }
-
-    /* ========== Private Functions ========== */
 
     function _addLiquidity(
         address token0,
@@ -272,7 +285,7 @@ contract Zap is OwnableUpgradeable, TransferHelper {
             IBEP20(token).safeTransfer(dustReceiver, leftoverToken);
         }
         if (leftoverBNB > 0) {
-            payable(dustReceiver).transfer(leftoverBNB);
+            safeTransferBNB(dustReceiver, leftoverBNB);
         }
     }
 
@@ -320,8 +333,10 @@ contract Zap is OwnableUpgradeable, TransferHelper {
             path[0] = WBNB;
             path[1] = token;
         }
-        uint[] memory amounts = ROUTER_V2.swapExactETHForTokens{value : value}(0, path, receiver, block.timestamp);
-        return amounts[amounts.length - 1];
+        uint before = IBEP20(token).balanceOf(receiver);
+        ROUTER_V2.swapExactETHForTokens{value : value}(0, path, receiver, block.timestamp);
+        uint post = IBEP20(token).balanceOf(receiver);
+        return post.sub(before);
     }
 
     function _swapTokenForBNB(address token, uint amount, address receiver) private returns (uint) {
@@ -401,8 +416,10 @@ contract Zap is OwnableUpgradeable, TransferHelper {
             path[2] = _to;
         }
 
-        uint[] memory amounts = ROUTER_V2.swapExactTokensForTokens(amount, 0, path, receiver, block.timestamp);
-        return amounts[amounts.length - 1];
+        uint before = IBEP20(_to).balanceOf(receiver);
+        ROUTER_V2.swapExactTokensForTokens(amount, 0, path, receiver, block.timestamp);
+        uint post = IBEP20(_to).balanceOf(receiver);
+        return post.sub(before);
     }
 
     /* ========== RESTRICTED FUNCTIONS ========== */

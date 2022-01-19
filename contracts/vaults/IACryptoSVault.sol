@@ -12,4 +12,5 @@ interface IACryptoSVault {
     function withdrawAllETH() external;
     function getPricePerFullShare() external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
+    function balance() external view returns (uint256);
 }

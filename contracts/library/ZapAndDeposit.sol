@@ -74,6 +74,7 @@ contract ZapAndDeposit is OwnableUpgradeable {
         bytes calldata _depositFarmLeftPayload
     ) external payable {
         IBEP20(_from).safeTransferFrom(msg.sender, address(this), amount);
+        approveToZap(_from);
         approveToRevault(_to);
         zap.zapInTokenTo(_from, amount, _to, address(this));
         uint balance = IBEP20(_to).balanceOf(address(this));
